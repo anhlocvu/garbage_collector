@@ -41,12 +41,12 @@ pub struct JunkCleanerApp {
     size_label: nwg::Label,
 
     #[nwg_control(text: "Scan Junk")]
-    #[nwg_layout_item(layout: layout, col: 0, row: 1, col_span: 2)]
+    #[nwg_layout_item(layout: layout, col: 0, row: 1, col_span: 4)]
     #[nwg_events( OnButtonClick: [JunkCleanerApp::start_scan] )]
     scan_btn: nwg::Button,
 
     #[nwg_control(text: "Clean Junk", enabled: false)]
-    #[nwg_layout_item(layout: layout, col: 2, row: 1, col_span: 2)]
+    #[nwg_layout_item(layout: layout, col: 0, row: 1, col_span: 4)]
     #[nwg_events( OnButtonClick: [JunkCleanerApp::start_clean] )]
     clean_btn: nwg::Button,
 
@@ -137,10 +137,15 @@ impl JunkCleanerApp {
         self.progress_bar.set_marquee(false, 0);
         self.progress_bar.set_pos(100);
 
-        self.scan_btn.set_enabled(true);
+        self.scan_btn.set_visible(false);
         if count > 0 {
             self.clean_btn.set_enabled(true);
+            self.clean_btn.set_visible(true);
+        } else {
+            self.scan_btn.set_enabled(true);
+            self.scan_btn.set_visible(true);
         }
+        self.list_box.set_focus();
     }
 
     fn start_clean(&self) {
@@ -222,9 +227,14 @@ impl JunkCleanerApp {
 
         self.progress_bar.set_pos(self.progress_bar.range().end);
 
-        self.scan_btn.set_enabled(true);
-        self.optimize_ram_cb.set_enabled(true);
         self.clean_btn.set_enabled(false);
+        self.clean_btn.set_visible(false);
+        
+        self.scan_btn.set_enabled(true);
+        self.scan_btn.set_visible(true);
+        
+        self.optimize_ram_cb.set_enabled(true);
+        self.list_box.set_focus();
     }
 }
 
@@ -241,5 +251,6 @@ fn main() {
     nwg::Font::set_global_default(Some(font));
 
     let _app = JunkCleanerApp::build_ui(Default::default()).expect("Failed to build UI");
+    _app.clean_btn.set_visible(false);
     nwg::dispatch_thread_events();
 }

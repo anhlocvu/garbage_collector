@@ -188,6 +188,7 @@ version = "0.1.0"
 dependencies = [
  "byte-unit",
  "crossbeam-channel",
+ "lazy_static",
  "native-windows-derive",
  "native-windows-gui",
  "walkdir",

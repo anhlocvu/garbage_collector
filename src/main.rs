@@ -3,6 +3,9 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::os::windows::process::CommandExt;
 
 use native_windows_gui as nwg;
 use native_windows_derive as nwd;
@@ -11,6 +14,9 @@ use nwd::NwgUi;
 use nwg::NativeUi;
 
 use byte_unit::Byte;
+use crossbeam_channel::{unbounded, Sender, Receiver};
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 mod scanner;
 use scanner::{JunkItem, JunkType, StartupItem, LargeFile, get_junk_directories, scan_directory, scan_dead_registry_keys, delete_junk_item, delete_registry_value};
@@ -21,6 +27,12 @@ pub enum AppMode {
     Junk,
     Startup,
     LargeFiles,
+    Repair,
+}
+
+pub enum ProgressMsg {
+    Update(u32, String),
+    Finished,
 }
 
 #[derive(Default)]
@@ -33,9 +45,9 @@ pub struct AppState {
     pub total_size: u64,
 }
 
-#[derive(Default, NwgUi)]
+#[derive(NwgUi)]
 pub struct JunkCleanerApp {
-    #[nwg_control(size: (650, 500), position: (300, 300), title: "Garbage Collector", flags: "WINDOW|VISIBLE")]
+    #[nwg_control(size: (680, 500), position: (300, 300), title: "Garbage Collector", flags: "WINDOW|VISIBLE")]
     #[nwg_events( OnWindowClose: [JunkCleanerApp::exit] )]
     window: nwg::Window,
 
@@ -51,7 +63,7 @@ pub struct JunkCleanerApp {
     #[nwg_layout_item(layout: layout, col: 2, row: 0, col_span: 2)]
     size_label: nwg::Label,
 
-    // Row 1 - Mode Selectors (Radio Buttons are 100% accessible for screen readers)
+    // Row 1 - Mode Selectors
     #[nwg_control(text: "1. Junk & Registry", check_state: nwg::RadioButtonState::Checked)]
     #[nwg_layout_item(layout: layout, col: 0, row: 1, col_span: 1)]
     #[nwg_events( OnButtonClick: [JunkCleanerApp::mode_junk] )]
@@ -63,9 +75,14 @@ pub struct JunkCleanerApp {
     mode_startup_radio: nwg::RadioButton,
 
     #[nwg_control(text: "3. Large File Finder")]
-    #[nwg_layout_item(layout: layout, col: 2, row: 1, col_span: 2)]
+    #[nwg_layout_item(layout: layout, col: 2, row: 1, col_span: 1)]
     #[nwg_events( OnButtonClick: [JunkCleanerApp::mode_large_files] )]
     mode_large_files_radio: nwg::RadioButton,
+
+    #[nwg_control(text: "4. System Repair")]
+    #[nwg_layout_item(layout: layout, col: 3, row: 1, col_span: 1)]
+    #[nwg_events( OnButtonClick: [JunkCleanerApp::mode_repair] )]
+    mode_repair_radio: nwg::RadioButton,
 
     // Row 2 - Action Buttons
     #[nwg_control(text: "Scan Junk")]
@@ -104,6 +121,42 @@ pub struct JunkCleanerApp {
     #[nwg_control]
     #[nwg_events( OnNotice: [JunkCleanerApp::on_execute_progress] )]
     execute_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events( OnNotice: [JunkCleanerApp::on_repair_progress] )]
+    repair_notice: nwg::Notice,
+    
+    // We cannot put Sender/Receiver directly here easily with NwgUi derive if it doesn't recognize them.
+    // Instead we can use lazy_static or global Mutex for the channel, but passing it through state is better.
+}
+
+// Global channel for simplicity to avoid macro issues
+lazy_static::lazy_static! {
+    static ref REPAIR_CHANNEL: (Sender<ProgressMsg>, Receiver<ProgressMsg>) = unbounded();
+}
+
+impl Default for JunkCleanerApp {
+    fn default() -> Self {
+        Self {
+            window: Default::default(),
+            layout: Default::default(),
+            status_label: Default::default(),
+            size_label: Default::default(),
+            mode_junk_radio: Default::default(),
+            mode_startup_radio: Default::default(),
+            mode_large_files_radio: Default::default(),
+            mode_repair_radio: Default::default(),
+            action_btn: Default::default(),
+            execute_btn: Default::default(),
+            optimize_ram_cb: Default::default(),
+            list_box: Default::default(),
+            progress_bar: Default::default(),
+            state: Default::default(),
+            scan_notice: Default::default(),
+            execute_notice: Default::default(),
+            repair_notice: Default::default(),
+        }
+    }
 }
 
 impl JunkCleanerApp {
@@ -121,6 +174,7 @@ impl JunkCleanerApp {
         self.list_box.clear();
         self.size_label.set_text("Total Size: 0 B");
         self.progress_bar.set_pos(0);
+        self.progress_bar.set_marquee(false, 0);
     }
 
     fn mode_junk(&self) {
@@ -147,14 +201,89 @@ impl JunkCleanerApp {
         self.update_ui_mode("Large File Finder Mode", "Scan Drive C: (>500MB)");
     }
 
+    fn mode_repair(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.is_working { return; }
+        state.mode = AppMode::Repair;
+        self.optimize_ram_cb.set_visible(false);
+        self.update_ui_mode("System Repair Mode (DISM + SFC)", "Start System Repair");
+        self.list_box.push(String::from("Ready to run DISM and SFC tools."));
+        self.list_box.push(String::from("This process takes 10-30 minutes and should not be interrupted."));
+    }
+
     fn start_action(&self) {
         let mut state = self.state.lock().unwrap();
         if state.is_working { return; }
         state.is_working = true;
         
         self.action_btn.set_enabled(false);
-        self.status_label.set_text("Scanning...");
+        self.status_label.set_text("Working...");
         self.list_box.clear();
+
+        if state.mode == AppMode::Repair {
+            self.progress_bar.set_state(nwg::ProgressBarState::Normal);
+            // Use marquee since extracting exact percentage is brittle, but we will send status messages.
+            self.progress_bar.set_marquee(true, 10);
+            
+            let notice = self.repair_notice.sender();
+            let state_clone = self.state.clone();
+            
+            thread::spawn(move || {
+                let tx = &REPAIR_CHANNEL.0;
+                let _ = tx.send(ProgressMsg::Update(0, "Starting DISM Component Store Restore...".to_string()));
+                notice.notice();
+
+                // Run DISM
+                let mut dism = Command::new("dism.exe")
+                    .args(&["/Online", "/Cleanup-Image", "/RestoreHealth"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("Failed to start DISM");
+
+                if let Some(stdout) = dism.stdout.take() {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines().filter_map(|l| l.ok()) {
+                        if line.contains('%') {
+                            // Extract % roughly if possible, else just report progress
+                            let _ = tx.send(ProgressMsg::Update(1, format!("DISM: {}", line.trim())));
+                            notice.notice();
+                        }
+                    }
+                }
+                let _ = dism.wait();
+
+                let _ = tx.send(ProgressMsg::Update(50, "DISM finished. Starting SFC System Scan...".to_string()));
+                notice.notice();
+
+                // Run SFC
+                let mut sfc = Command::new("sfc.exe")
+                    .arg("/scannow")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("Failed to start SFC");
+
+                if let Some(stdout) = sfc.stdout.take() {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines().filter_map(|l| l.ok()) {
+                        if !line.trim().is_empty() {
+                            let _ = tx.send(ProgressMsg::Update(2, format!("SFC: {}", line.trim())));
+                            notice.notice();
+                        }
+                    }
+                }
+                let _ = sfc.wait();
+
+                let _ = tx.send(ProgressMsg::Finished);
+                notice.notice();
+
+                let mut s = state_clone.lock().unwrap();
+                s.is_working = false;
+            });
+            return;
+        }
+
         self.progress_bar.set_state(nwg::ProgressBarState::Normal);
         self.progress_bar.set_range(0..100);
         self.progress_bar.set_pos(0);
@@ -276,6 +405,33 @@ impl JunkCleanerApp {
         self.list_box.set_focus();
     }
 
+    fn on_repair_progress(&self) {
+        let rx = &REPAIR_CHANNEL.1;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ProgressMsg::Update(_, text) => {
+                    self.list_box.push(text);
+                    // auto scroll to bottom
+                    let count = self.list_box.len();
+                    if count > 0 {
+                        // Nwg ListBox doesn't have an easy direct scroll-to-bottom without winapi, 
+                        // but setting selection to the last item helps
+                        self.list_box.set_selection(Some(count - 1));
+                    }
+                },
+                ProgressMsg::Finished => {
+                    self.progress_bar.set_marquee(false, 0);
+                    self.progress_bar.set_pos(100);
+                    self.status_label.set_text("System Repair Complete.");
+                    self.list_box.push(String::from("Repair finished successfully. Please restart your PC if recommended by SFC."));
+                    self.action_btn.set_enabled(true);
+                    self.action_btn.set_text("Start System Repair Again");
+                    self.list_box.set_focus();
+                }
+            }
+        }
+    }
+
     fn execute_action(&self) {
         let mut state = self.state.lock().unwrap();
         if state.is_working { return; }
@@ -289,7 +445,6 @@ impl JunkCleanerApp {
                     let _ = delete_registry_value(item.hkey, &item.subkey, &item.name);
                     nwg::modal_info_message(&self.window, "Success", &format!("Disabled startup item: {}", item.name));
                     
-                    // Release the lock before calling start_action which also takes the lock
                     drop(state);
                     self.start_action();
                 }

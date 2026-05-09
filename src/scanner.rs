@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::os::windows::process::CommandExt;
 use walkdir::WalkDir;
 use winreg::enums::*;
 use winreg::RegKey;
@@ -10,6 +11,8 @@ use windows_sys::Win32::System::ProcessStatus::{EnumProcesses, K32EmptyWorkingSe
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_QUERY_INFORMATION};
 use windows_sys::Win32::Foundation::CloseHandle;
 use std::mem;
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum JunkType {
@@ -261,11 +264,11 @@ pub fn run_disk_cleanup() {
         }
     }
 
-    let _ = Command::new("cleanmgr.exe").arg("/sagerun:1").status();
+    let _ = Command::new("cleanmgr.exe").arg("/sagerun:1").creation_flags(CREATE_NO_WINDOW).status();
 }
 
 pub fn optimize_ram() {
-    let _ = Command::new("ipconfig").arg("/flushdns").status();
+    let _ = Command::new("ipconfig").arg("/flushdns").creation_flags(CREATE_NO_WINDOW).status();
 
     unsafe {
         let mut processes = [0u32; 1024];
